@@ -70,7 +70,7 @@ class EncoderAttention(nn.Module):
             self.head_dim, traditional=True, base=config.rope_theta
         )
 
-    def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
         B, T, _ = x.shape
 
         q = self.q_proj(x)
@@ -81,11 +81,18 @@ class EncoderAttention(nn.Module):
         k = k.reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q = self.rope(q)
-        k = self.rope(k)
+        if cache is not None:
+            q = self.rope(q, offset=cache.offset)
+            k = self.rope(k, offset=cache.offset)
+            k, v = cache.update_and_fetch(k, v)
+        else:
+            q = self.rope(q)
+            k = self.rope(k)
 
+        # Use SDPA's built-in causal mask when no explicit mask is needed
+        sdpa_mask = "causal" if mask is None else mask
         out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=self.scale, mask=mask
+            q, k, v, scale=self.scale, mask=sdpa_mask
         )
         out = out.transpose(0, 2, 1, 3).reshape(B, T, self.attn_dim)
         return self.out_proj(out)
@@ -114,10 +121,10 @@ class RealtimeEncoderLayer(nn.Module):
         self.gate_proj = EncoderSwiGLU(config)
         self.final_layer_norm = nn.RMSNorm(config.d_model, eps=config.rms_norm_eps)
 
-    def __call__(self, x: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+    def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:
         r = x
         x = self.self_attn_layer_norm(x)
-        x = self.self_attn(x, mask=mask)
+        x = self.self_attn(x, mask=mask, cache=cache)
         x = r + x
 
         r = x
@@ -144,39 +151,73 @@ class RealtimeEncoder(nn.Module):
         ]
         self.layer_norm = nn.RMSNorm(embed_dim, eps=config.rms_norm_eps)
 
-    def _make_causal_mask(self, T: int, sliding_window: Optional[int] = None) -> mx.array:
+    def _make_causal_mask(self, T: int, sliding_window: Optional[int] = None):
         """Create causal attention mask with optional sliding window."""
-        mask = nn.MultiHeadAttention.create_additive_causal_mask(T)
-        if sliding_window is not None:
-            # Zero out positions beyond the sliding window
-            row_ids = mx.arange(T)[:, None]
-            col_ids = mx.arange(T)[None, :]
-            window_mask = mx.where(
-                (row_ids - col_ids) >= sliding_window,
-                mx.array(float("-inf")),
-                mx.array(0.0),
-            )
-            mask = mask + window_mask
+        if sliding_window is None or sliding_window >= T:
+            return None  # Let SDPA handle causality internally
+        # Single-pass combined causal + sliding window mask
+        row_ids = mx.arange(T)[:, None]
+        col_ids = mx.arange(T)[None, :]
+        mask = mx.where(
+            (col_ids > row_ids) | ((row_ids - col_ids) >= sliding_window),
+            mx.array(float("-inf")),
+            mx.array(0.0),
+        )
         return mask
 
-    def __call__(self, x: mx.array) -> mx.array:
-        # x: [B, T, n_mels]
+    def conv_stem(self, x: mx.array) -> mx.array:
+        """Run conv layers and align to downsample_factor. Returns [B, T', D]."""
         x = nn.gelu(self.conv1(x))
         x = nn.gelu(self.conv2(x))
-
-        # Truncate to align with downsample_factor
         T = x.shape[1]
         remainder = T % self.downsample_factor
         if remainder != 0:
             x = x[:, remainder:]
+        return x
 
-        T = x.shape[1]
-        mask = self._make_causal_mask(T, self.config.sliding_window)
+    def encode_chunks(self, conv_out: mx.array):
+        """Generator that yields encoder output per chunk.
 
-        for layer in self.layers:
-            x = layer(x, mask=mask)
+        Processes the conv output through 32 transformer layers in
+        sliding-window-sized chunks with KV caching. Each chunk's output
+        has layer_norm applied and is ready for 4x downsample + projection.
 
-        return self.layer_norm(x)
+        Yields:
+            mx.array of shape [B, chunk_size, D] for each chunk.
+        """
+        from mlx_lm.models.cache import RotatingKVCache
+
+        T = conv_out.shape[1]
+        sw = self.config.sliding_window
+        chunk_size = sw
+        n_layers = len(self.layers)
+        caches = [RotatingKVCache(max_size=sw, keep=0) for _ in range(n_layers)]
+
+        for chunk_start in range(0, T, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, T)
+            chunk = conv_out[:, chunk_start:chunk_end, :]
+
+            h = chunk
+            for i, layer in enumerate(self.layers):
+                mask = caches[i].make_mask(h.shape[1], window_size=sw)
+                h = layer(h, mask=mask, cache=caches[i])
+
+            yield self.layer_norm(h)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        conv_out = self.conv_stem(x)
+        T = conv_out.shape[1]
+        sw = self.config.sliding_window
+
+        if T <= sw:
+            h = conv_out
+            for layer in self.layers:
+                h = layer(h, mask="causal")
+            return self.layer_norm(h)
+
+        # Collect all chunks
+        all_outputs = list(self.encode_chunks(conv_out))
+        return mx.concatenate(all_outputs, axis=1)
 
 
 # =============================================================================
@@ -380,8 +421,7 @@ class MistralRealtimeModel(nn.Module):
 
         mask = None
         if h.shape[1] > 1:
-            mask = nn.MultiHeadAttention.create_additive_causal_mask(h.shape[1])
-            mask = mask.astype(h.dtype)
+            mask = "causal"
 
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
@@ -439,13 +479,18 @@ class Model(nn.Module):
         """Encode mel spectrogram to audio embeddings."""
         # mel: [B, T, n_mels]
         encoded = self.audio_tower(mel)  # [B, T', 1280]
+        return self._downsample_and_project(encoded)
 
+    def _downsample_and_project(self, encoded: mx.array) -> mx.array:
+        """4x downsample encoder output and project to text dim."""
         B, T, D = encoded.shape
-        # 4x downsample via reshape
-        encoded = encoded.reshape(B, T // self.config.audio_config.downsample_factor, -1)
-        # Project to text dim
-        audio_embeds = self.multi_modal_projector(encoded)
-        return audio_embeds
+        ds = self.config.audio_config.downsample_factor
+        # Truncate to multiple of downsample_factor
+        T_aligned = (T // ds) * ds
+        if T_aligned < T:
+            encoded = encoded[:, :T_aligned, :]
+        encoded = encoded.reshape(B, T_aligned // ds, -1)
+        return self.multi_modal_projector(encoded)
 
     def _merge_input_embeddings(
         self,
@@ -755,11 +800,11 @@ class Model(nn.Module):
         generation_stream: bool = False,
         verbose: bool = False,
     ) -> Generator[Tuple[mx.array, mx.array], None, None]:
-        """Stream token generation with per-step audio embedding summation.
+        """Stream token generation with incremental audio encoding.
 
-        In the realtime model, audio embeddings are summed with text embeddings
-        at every position, including during autoregressive generation — not just
-        during prefill.
+        Exploits the causal encoder to encode only the first audio chunk
+        for prefill, then encodes remaining chunks interleaved with token
+        generation. This dramatically reduces time-to-first-token.
         """
         from mlx_lm.models.cache import KVCache
 
@@ -767,16 +812,43 @@ class Model(nn.Module):
         if sampler is None:
             sampler = lambda logits: mx.argmax(logits, axis=-1)
 
-        # Pre-compute all audio embeddings
-        audio_embeds = None
+        prompt_len = input_ids.shape[1]
+        ds = self.config.audio_config.downsample_factor
+
+        # Incremental audio encoding: conv stem once, then encode chunks
+        # on demand. Each chunk produces audio embeddings for a portion
+        # of the sequence.
+        audio_embeds_list = []  # accumulated audio embeddings
         audio_len = 0
+        enc_chunk_gen = None
+
         if input_features is not None:
-            audio_embeds = self.get_audio_embeds(input_features)  # [1, A, D]
-            audio_len = audio_embeds.shape[1]
+            # Run conv stem (cheap: ~10ms for full audio)
+            conv_out = self.audio_tower.conv_stem(input_features)
+            enc_chunk_gen = self.audio_tower.encode_chunks(conv_out)
+
+            # Encode first chunk — enough for prefill (prompt_len tokens)
+            # Each encoder chunk of sw frames → sw/ds audio embeddings
+            min_embeds_needed = prompt_len
+            while audio_len < min_embeds_needed and enc_chunk_gen is not None:
+                try:
+                    chunk_out = next(enc_chunk_gen)
+                    chunk_embeds = self._downsample_and_project(chunk_out)
+                    mx.eval(chunk_embeds)
+                    audio_embeds_list.append(chunk_embeds)
+                    audio_len += chunk_embeds.shape[1]
+                except StopIteration:
+                    enc_chunk_gen = None
+
+        # Concatenate available audio embeddings
+        audio_embeds = (
+            mx.concatenate(audio_embeds_list, axis=1)
+            if audio_embeds_list
+            else None
+        )
 
         # Get text embeddings for prompt
-        text_embeds = self.language_model.model.embed_tokens(input_ids)  # [1, L, D]
-        prompt_len = input_ids.shape[1]
+        text_embeds = self.language_model.model.embed_tokens(input_ids)
 
         # Sum audio with text for the prompt positions
         if audio_embeds is not None:
@@ -812,13 +884,31 @@ class Model(nn.Module):
                 return
             yield y, logprobs
 
-            # Autoregressive loop — sum audio embed with token embed at each step
+            # Autoregressive loop — sum audio embed with token embed at each
+            # step. Encode additional audio chunks on demand.
             current_pos = prompt_len
             for step in tqdm(
                 range(max_tokens - 1),
                 disable=not verbose,
                 desc="Generating",
             ):
+                # Encode more audio if we're about to run out
+                if (
+                    enc_chunk_gen is not None
+                    and current_pos >= audio_len - 1
+                ):
+                    try:
+                        chunk_out = next(enc_chunk_gen)
+                        chunk_embeds = self._downsample_and_project(chunk_out)
+                        mx.eval(chunk_embeds)
+                        audio_embeds_list.append(chunk_embeds)
+                        audio_embeds = mx.concatenate(
+                            audio_embeds_list, axis=1
+                        )
+                        audio_len = audio_embeds.shape[1]
+                    except StopIteration:
+                        enc_chunk_gen = None
+
                 # Embed the last generated token
                 token_embed = self.language_model.model.embed_tokens(
                     y.reshape(1, 1)
