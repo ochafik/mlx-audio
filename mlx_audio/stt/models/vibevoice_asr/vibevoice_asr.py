@@ -3,8 +3,9 @@
 import re
 import time
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -82,6 +83,35 @@ class LanguageModel(nn.Module):
     @property
     def embed_tokens(self):
         return self.model.embed_tokens
+
+
+VIBEVOICE_SAMPLE_RATE = 24000
+
+
+@dataclass
+class StreamingVibeVoiceSession:
+    """Persistent session for incremental VibeVoice-ASR encoding.
+
+    VibeVoice's Qwen2 LM requires a pre-built prompt with known audio length,
+    so streaming works in two phases:
+    1. Encoding phase: feed_audio() encodes audio incrementally through both
+       tokenizers (acoustic + semantic) using conv caches. No text is produced.
+    2. Decode phase: finish_session() builds the prompt from accumulated features
+       and runs the LM to produce text.
+
+    This reduces end-to-end latency because encoding happens concurrently with
+    audio input, rather than all at once after audio ends.
+    """
+
+    acoustic_caches: Optional[list]
+    semantic_caches: Optional[list]
+    acoustic_features: list = field(default_factory=list)
+    semantic_features: list = field(default_factory=list)
+    audio_buffer: Optional[np.ndarray] = field(
+        default_factory=lambda: np.array([], dtype=np.float32)
+    )
+    total_audio_samples: int = 0
+    finished: bool = False
 
 
 class Model(nn.Module):
@@ -284,6 +314,156 @@ class Model(nn.Module):
         )
 
         return logits
+
+    # --- Streaming audio input API ---
+
+    def supports_streaming_input(self) -> bool:
+        return True
+
+    def create_streaming_session(self) -> StreamingVibeVoiceSession:
+        """Initialize a new streaming session with empty conv caches."""
+        return StreamingVibeVoiceSession(
+            acoustic_caches=None,
+            semantic_caches=None,
+        )
+
+    def feed_audio(
+        self,
+        session: StreamingVibeVoiceSession,
+        pcm_24k: Union[bytes, np.ndarray],
+    ) -> list:
+        """Feed an audio chunk for incremental encoding.
+
+        Audio is encoded through both tokenizers incrementally using conv
+        caches. No text is produced during encoding — call finish_session()
+        to decode.
+
+        Args:
+            session: Active streaming session
+            pcm_24k: Raw PCM data at 24kHz. Either:
+                - bytes: PCM Int16 (2 bytes per sample)
+                - np.ndarray: float32 samples
+
+        Returns:
+            Empty list (text is only produced on finish_session).
+        """
+        if session.finished:
+            return []
+
+        # Convert to float32
+        if isinstance(pcm_24k, bytes):
+            samples = np.frombuffer(pcm_24k, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            samples = np.asarray(pcm_24k, dtype=np.float32)
+
+        if len(samples) == 0:
+            return []
+
+        session.total_audio_samples += len(samples)
+
+        # Prepare audio tensor [B, T, C=1]
+        audio_mx = mx.array(samples, dtype=mx.float32)[None, :, None]
+
+        # Encode through acoustic tokenizer incrementally
+        acoustic_out, session.acoustic_caches = (
+            self.acoustic_tokenizer.forward_streaming(audio_mx, session.acoustic_caches)
+        )
+        mx.eval(acoustic_out)
+        if acoustic_out.shape[1] > 0:
+            session.acoustic_features.append(acoustic_out)
+
+        # Encode through semantic tokenizer incrementally
+        semantic_out, session.semantic_caches = (
+            self.semantic_tokenizer.forward_streaming(audio_mx, session.semantic_caches)
+        )
+        mx.eval(semantic_out)
+        if semantic_out.shape[1] > 0:
+            session.semantic_features.append(semantic_out)
+
+        return []  # No text during encoding phase
+
+    def finish_session(
+        self,
+        session: StreamingVibeVoiceSession,
+        *,
+        context: Optional[str] = None,
+        max_tokens: int = 8192,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
+        top_k: int = 25,
+        min_p: float = 0.02,
+        repetition_penalty: Optional[float] = 1.2,
+        repetition_context_size: int = 100,
+        verbose: bool = False,
+    ) -> str:
+        """Flush encoding and decode the full transcript.
+
+        Builds the Qwen2 prompt from accumulated speech features and
+        runs the LM to produce text.
+
+        Returns:
+            Final transcript text.
+        """
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        if session.finished:
+            return ""
+
+        session.finished = True
+
+        # Concatenate accumulated features
+        if not session.acoustic_features or not session.semantic_features:
+            return ""
+
+        acoustic_tokens = mx.concatenate(session.acoustic_features, axis=1)
+        semantic_tokens = mx.concatenate(session.semantic_features, axis=1)
+
+        # Ensure same length (trim to shorter)
+        min_len = min(acoustic_tokens.shape[1], semantic_tokens.shape[1])
+        acoustic_tokens = acoustic_tokens[:, :min_len, :]
+        semantic_tokens = semantic_tokens[:, :min_len, :]
+
+        # Project through connectors
+        acoustic_features = self.acoustic_connector(acoustic_tokens)
+        mx.eval(acoustic_features)
+        semantic_features = self.semantic_connector(semantic_tokens)
+        mx.eval(semantic_features)
+
+        # Combine
+        speech_features = acoustic_features + semantic_features
+
+        # Build prompt
+        audio_duration = session.total_audio_samples / VIBEVOICE_SAMPLE_RATE
+        input_ids, acoustic_input_mask = self._build_prompt_tokens(
+            speech_features, audio_duration, context
+        )
+
+        # Create sampler and logits processors
+        sampler = make_sampler(
+            temperature, top_p, min_p, min_tokens_to_keep=1, top_k=top_k,
+        )
+        logits_processors = make_logits_processors(
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
+        )
+
+        # Generate tokens
+        generated_tokens = []
+        for token, _ in self.stream_generate(
+            input_ids=input_ids,
+            speech_features=speech_features,
+            acoustic_input_mask=acoustic_input_mask,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            verbose=verbose,
+        ):
+            generated_tokens.append(token)
+
+        mx.clear_cache()
+
+        text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return text.strip()
 
     @staticmethod
     def sanitize(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

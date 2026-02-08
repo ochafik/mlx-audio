@@ -1,7 +1,8 @@
 # Copyright (c) 2025, Prince Canuma and contributors (https://github.com/Blaizzy/mlx-audio)
 
 import math
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -248,6 +249,52 @@ class SConv1d(nn.Module):
 
         return mx.concatenate(outputs, axis=1)
 
+    def forward_streaming(self, x: mx.array, cache: Optional[mx.array] = None):
+        """Forward pass with conv cache for streaming.
+
+        For causal convolutions, maintains a left-padding cache of
+        `padding_total` samples between calls.
+
+        Args:
+            x: Input tensor [B, T, C]
+            cache: [B, padding_total, C] from previous call, or None
+
+        Returns:
+            (output [B, T', C'], new_cache)
+        """
+        if not self.causal:
+            raise NotImplementedError("Streaming only supported for causal convolutions")
+
+        B, T, C = x.shape
+
+        # Prepend cache (or zero-pad for first call)
+        if cache is not None:
+            x_padded = mx.concatenate([cache, x], axis=1)
+        else:
+            if self.padding_total > 0:
+                x_padded = mx.pad(x, [(0, 0), (self.padding_total, 0), (0, 0)])
+            else:
+                x_padded = x
+
+        # Save cache for next call: last padding_total samples
+        if self.padding_total > 0:
+            new_cache = x_padded[:, -self.padding_total:, :]
+        else:
+            new_cache = None
+
+        # Extra right padding for stride alignment
+        extra = self._get_extra_padding(T)
+        if extra > 0:
+            x_padded = mx.pad(x_padded, [(0, 0), (0, extra), (0, 0)])
+
+        # Run conv (padding already applied)
+        if self.groups > 1 and self.groups == self.in_channels:
+            out = self._depthwise_conv(x_padded, 0, 0)
+        else:
+            out = self.conv(x_padded)
+
+        return out, new_cache
+
 
 class FFN(nn.Module):
     """Feed-forward network with GELU activation."""
@@ -438,6 +485,34 @@ class Block1D(nn.Module):
 
         return mx.concatenate(outputs, axis=1)
 
+    def forward_streaming(self, x: mx.array, cache: Optional[mx.array] = None):
+        """Process a chunk through the block with conv cache for streaming.
+
+        Args:
+            x: Input tensor [B, T, C]
+            cache: Conv cache for the mixer's SConv1d
+
+        Returns:
+            (output [B, T, C], new_cache)
+        """
+        # Mixer path with streaming cache
+        residual = x
+        x_normed = self.norm(x)
+        x_mixed, new_cache = self.mixer.conv.forward_streaming(x_normed, cache)
+        if self.gamma is not None:
+            x_mixed = x_mixed * self.gamma
+        x = residual + x_mixed
+
+        # FFN path (pointwise, no state)
+        residual = x
+        x_normed = self.ffn_norm(x)
+        x_ffn = self.ffn(x_normed)
+        if self.ffn_gamma is not None:
+            x_ffn = x_ffn * self.ffn_gamma
+        x = residual + x_ffn
+
+        return x, new_cache
+
 
 class TokenizerEncoder(nn.Module):
     """
@@ -596,6 +671,52 @@ class TokenizerEncoder(nn.Module):
 
         return x  # [B, T', vae_dim]
 
+    def num_streaming_caches(self) -> int:
+        """Count the total number of SConv1d caches needed for streaming."""
+        count = self.n_stages  # one downsample per stage
+        for stage in self.stages:
+            count += len(stage)  # one per Block1D
+        count += 1  # head
+        return count
+
+    def forward_streaming(self, x: mx.array, caches: Optional[list] = None):
+        """Encode audio incrementally with conv caches.
+
+        Args:
+            x: Audio chunk [B, T, C] (mono audio, C=1)
+            caches: List of SConv1d caches, length = num_streaming_caches()
+
+        Returns:
+            (latent [B, T', vae_dim], updated_caches)
+        """
+        n_caches = self.num_streaming_caches()
+        if caches is None:
+            caches = [None] * n_caches
+
+        cache_idx = 0
+        for i in range(self.n_stages):
+            x, caches[cache_idx] = self.downsample_layers[i].forward_streaming(
+                x, caches[cache_idx]
+            )
+            cache_idx += 1
+            mx.eval(x)
+
+            for block in self.stages[i]:
+                x, caches[cache_idx] = block.forward_streaming(x, caches[cache_idx])
+                cache_idx += 1
+                mx.eval(x)
+
+        # Final norm
+        if self.norm is not None:
+            x_t = x.transpose(0, 2, 1)
+            x_t = self.norm(x_t)
+            x = x_t.transpose(0, 2, 1)
+
+        # Head projection with streaming cache
+        x, caches[cache_idx] = self.head.forward_streaming(x, caches[cache_idx])
+
+        return x, caches  # [B, T', vae_dim]
+
 
 class AcousticTokenizerEncoder(nn.Module):
     """Acoustic tokenizer encoder wrapper with config-based initialization."""
@@ -667,6 +788,19 @@ class AcousticTokenizerEncoder(nn.Module):
         mean = self.encode(audio)
         return self.sample(mean)
 
+    def forward_streaming(self, audio: mx.array, caches: Optional[list] = None):
+        """Encode audio chunk incrementally.
+
+        Returns:
+            (latent [B, T', vae_dim], updated_caches)
+        """
+        mean, caches = self.encoder.forward_streaming(audio, caches)
+        sampled = self.sample(mean)
+        return sampled, caches
+
+    def num_streaming_caches(self) -> int:
+        return self.encoder.num_streaming_caches()
+
 
 class SemanticTokenizerEncoder(nn.Module):
     """Semantic tokenizer encoder wrapper with config-based initialization."""
@@ -709,3 +843,14 @@ class SemanticTokenizerEncoder(nn.Module):
     def __call__(self, audio: mx.array) -> mx.array:
         """Encode audio (semantic tokenizer doesn't sample)."""
         return self.encode(audio)
+
+    def forward_streaming(self, audio: mx.array, caches: Optional[list] = None):
+        """Encode audio chunk incrementally.
+
+        Returns:
+            (latent [B, T', vae_dim], updated_caches)
+        """
+        return self.encoder.forward_streaming(audio, caches)
+
+    def num_streaming_caches(self) -> int:
+        return self.encoder.num_streaming_caches()
