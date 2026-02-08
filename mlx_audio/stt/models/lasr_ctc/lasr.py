@@ -1,8 +1,10 @@
 import math
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from mlx_audio.stt.models.base import STTOutput
 
@@ -397,3 +399,249 @@ class LasrForCTC(nn.Module):
             new_weights[k] = v
 
         return new_weights
+
+    # --- Chunk-based streaming API ---
+    #
+    # LASR-CTC uses bidirectional attention and symmetric convolutions,
+    # so true frame-by-frame streaming is not possible. Instead, we
+    # process audio in overlapping chunks, CTC-decode each chunk, and
+    # stitch the results together.
+
+    def supports_streaming_input(self) -> bool:
+        return True
+
+    def create_streaming_session(
+        self,
+        chunk_duration_s: float = 2.0,
+        overlap_duration_s: float = 0.5,
+        sample_rate: int = 16000,
+        hop_length: int = 160,
+        n_fft: int = 400,
+    ) -> "StreamingLasrSession":
+        """Create a chunk-based streaming session.
+
+        Args:
+            chunk_duration_s: Duration of each processing chunk in seconds
+            overlap_duration_s: Overlap between consecutive chunks in seconds
+            sample_rate: Audio sample rate (for mel computation)
+            hop_length: STFT hop length
+            n_fft: STFT window size
+        """
+        return StreamingLasrSession(
+            chunk_samples=int(chunk_duration_s * sample_rate),
+            overlap_samples=int(overlap_duration_s * sample_rate),
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+            n_fft=n_fft,
+        )
+
+    def feed_audio(
+        self,
+        session: "StreamingLasrSession",
+        pcm_16k: Union[bytes, np.ndarray],
+    ) -> list:
+        """Feed audio chunk and return new CTC-decoded token sequences.
+
+        Buffers audio until a full chunk is available, then processes it
+        through the encoder and CTC-decodes.
+
+        Args:
+            session: Active streaming session
+            pcm_16k: PCM audio at 16kHz (bytes=Int16, ndarray=float32)
+
+        Returns:
+            List of new token ID sequences (one per completed chunk).
+            Each is a list of int token IDs after CTC dedup + blank removal.
+        """
+        if session.finished:
+            return []
+
+        if isinstance(pcm_16k, bytes):
+            samples = np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            samples = np.asarray(pcm_16k, dtype=np.float32)
+
+        if len(samples) == 0:
+            return []
+
+        session.audio_buffer = np.concatenate([session.audio_buffer, samples])
+        results = []
+
+        stride = session.chunk_samples - session.overlap_samples
+        if stride <= 0:
+            stride = session.chunk_samples  # Fallback: no overlap
+
+        while len(session.audio_buffer) >= session.chunk_samples:
+            chunk = session.audio_buffer[:session.chunk_samples]
+
+            tokens = self._process_chunk(chunk, session)
+            if tokens:
+                results.append(tokens)
+
+            # Advance by stride (keep overlap)
+            session.audio_buffer = session.audio_buffer[stride:]
+
+        return results
+
+    def finish_session(self, session: "StreamingLasrSession") -> list:
+        """Process any remaining audio in the buffer.
+
+        Returns:
+            List of token ID sequences from the final chunk (may be empty).
+        """
+        if session.finished:
+            return []
+
+        session.finished = True
+        results = []
+
+        # Process remaining audio if there's enough for mel computation
+        if len(session.audio_buffer) > session.n_fft:
+            tokens = self._process_chunk(session.audio_buffer, session)
+            if tokens:
+                results.append(tokens)
+
+        return results
+
+    def _process_chunk(
+        self, audio_chunk: np.ndarray, session: "StreamingLasrSession"
+    ) -> list:
+        """Process a single audio chunk through mel → encoder → CTC decode.
+
+        Returns list of non-blank, deduplicated token IDs.
+        """
+        # Compute mel spectrogram for this chunk
+        mel = self._compute_mel_features(
+            audio_chunk, session.sample_rate, session.hop_length, session.n_fft,
+            n_mels=self.config.encoder_config.num_mel_bins,
+        )
+        if mel is None or mel.shape[1] == 0:
+            return []
+
+        # mel: [1, frames, mel_bins]
+        mel_mx = mx.array(mel[None, :, :], dtype=mx.float32)
+
+        # Forward through encoder + CTC head
+        logits = self(mel_mx)  # [1, frames', vocab_size]
+        mx.eval(logits)
+
+        # Greedy CTC decode
+        tokens = mx.argmax(logits[0], axis=-1)  # [frames']
+        tokens = np.array(tokens).tolist()
+
+        # CTC collapse: remove consecutive duplicates, then remove blanks
+        deduped = []
+        prev = None
+        for t in tokens:
+            if t != prev:
+                deduped.append(t)
+            prev = t
+
+        # Remove blank token (typically 0)
+        blank_id = self.config.pad_token_id
+        deduped = [t for t in deduped if t != blank_id]
+
+        # Handle overlap deduplication with previous chunk
+        if session.prev_chunk_tokens and deduped:
+            # Remove prefix tokens that match the tail of the previous chunk
+            # (these come from the overlap region)
+            overlap_frames = session.overlap_samples // session.hop_length // 4  # ~4x subsample
+            tail = session.prev_chunk_tokens[-overlap_frames:] if overlap_frames > 0 else []
+            if tail:
+                # Find and remove overlapping prefix
+                max_match = min(len(tail), len(deduped))
+                match_len = 0
+                for i in range(1, max_match + 1):
+                    if tail[-i:] == deduped[:i]:
+                        match_len = i
+                if match_len > 0:
+                    deduped = deduped[match_len:]
+
+        session.prev_chunk_tokens = deduped if deduped else session.prev_chunk_tokens
+
+        return deduped
+
+    @staticmethod
+    def _compute_mel_features(
+        audio: np.ndarray,
+        sample_rate: int = 16000,
+        hop_length: int = 160,
+        n_fft: int = 400,
+        n_mels: int = 128,
+    ) -> Optional[np.ndarray]:
+        """Compute log-mel spectrogram features for a chunk.
+
+        Returns mel features as [frames, n_mels] numpy array, or None.
+        """
+        if len(audio) < n_fft:
+            return None
+
+        # Simple mel computation using numpy
+        # Window
+        window = np.hanning(n_fft + 1)[:-1].astype(np.float32)
+
+        # Pad for STFT
+        n_frames = 1 + (len(audio) - n_fft) // hop_length
+        if n_frames <= 0:
+            return None
+
+        # Frame extraction
+        indices = np.arange(n_fft)[None, :] + (np.arange(n_frames) * hop_length)[:, None]
+        if indices.max() >= len(audio):
+            n_frames = (len(audio) - n_fft) // hop_length + 1
+            indices = np.arange(n_fft)[None, :] + (np.arange(n_frames) * hop_length)[:, None]
+
+        frames = audio[indices] * window[None, :]
+
+        # FFT
+        spectrum = np.fft.rfft(frames, n=n_fft, axis=-1)
+        magnitudes = np.abs(spectrum) ** 2
+
+        # Mel filter bank (simple triangular)
+        n_freq = 1 + n_fft // 2
+        mel_low = 0.0
+        mel_high = 2595.0 * np.log10(1.0 + (sample_rate / 2.0) / 700.0)
+        mel_points = np.linspace(mel_low, mel_high, n_mels + 2)
+        hz_points = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
+        bins = np.floor((n_fft + 1) * hz_points / sample_rate).astype(int)
+
+        fb = np.zeros((n_freq, n_mels), dtype=np.float32)
+        for m in range(n_mels):
+            f_left = bins[m]
+            f_center = bins[m + 1]
+            f_right = bins[m + 2]
+            for k in range(f_left, f_center):
+                if f_center > f_left:
+                    fb[k, m] = (k - f_left) / (f_center - f_left)
+            for k in range(f_center, f_right):
+                if f_right > f_center:
+                    fb[k, m] = (f_right - k) / (f_right - f_center)
+
+        mel_spec = magnitudes @ fb  # [frames, n_mels]
+
+        # Log scale
+        mel_spec = np.log(np.maximum(mel_spec, 1e-10))
+
+        return mel_spec
+
+
+@dataclass
+class StreamingLasrSession:
+    """Session for chunk-based streaming CTC decoding.
+
+    LASR-CTC uses bidirectional attention, so true frame-by-frame
+    streaming is not possible. Instead, audio is processed in overlapping
+    chunks. Each chunk is independently encoded and CTC-decoded, with
+    overlap deduplication to stitch results.
+    """
+
+    chunk_samples: int = 32000  # 2s at 16kHz
+    overlap_samples: int = 8000  # 0.5s overlap
+    sample_rate: int = 16000
+    hop_length: int = 160
+    n_fft: int = 400
+    audio_buffer: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=np.float32)
+    )
+    prev_chunk_tokens: list = field(default_factory=list)
+    finished: bool = False
