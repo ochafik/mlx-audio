@@ -1,5 +1,5 @@
 from .config import AudioEncodingConfig, DecoderConfig, EncoderConfig, ModelConfig
-from .voxtral_realtime import Model
+from .voxtral_realtime import Model, StreamingSTTSession
 
 __all__ = [
     "AudioEncodingConfig",
@@ -7,4 +7,5 @@ __all__ = [
     "EncoderConfig",
     "ModelConfig",
     "Model",
+    "StreamingSTTSession",
 ]

@@ -9,6 +9,7 @@ Matches the exact computation from vLLM/mistral_common:
 """
 
 import math
+from dataclasses import dataclass, field
 
 import mlx.core as mx
 import numpy as np
@@ -127,3 +128,103 @@ def compute_mel_spectrogram(
     log_spec = (log_spec + 4.0) / 4.0
 
     return log_spec  # [128, frames]
+
+
+@dataclass
+class StreamingMelState:
+    """State for incremental mel spectrogram computation.
+
+    Maintains an overlap buffer of (window_size - hop_length) samples
+    to handle STFT windowing across chunk boundaries.
+    """
+
+    overlap_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    is_first_chunk: bool = True
+
+
+def compute_mel_streaming(
+    samples_16k: np.ndarray,
+    state: StreamingMelState,
+    mel_filters: mx.array,
+    window_size: int = 400,
+    hop_length: int = 160,
+    global_log_mel_max: float = 1.5,
+) -> tuple:
+    """Compute mel spectrogram for a new audio chunk incrementally.
+
+    Handles STFT windowing overlap between chunks. On the first chunk,
+    applies center-padding (reflect) on the left side. Subsequent chunks
+    use the overlap buffer from the previous chunk.
+
+    Args:
+        samples_16k: New audio samples (float32, 16kHz)
+        state: Streaming state with overlap buffer
+        mel_filters: Precomputed mel filter bank [freq_bins, mel_bins]
+        window_size: STFT window size (n_fft)
+        hop_length: STFT hop length
+        global_log_mel_max: Fixed max for log clamping
+
+    Returns:
+        (mel_frames, updated_state) where mel_frames is [mel_bins, frames]
+        or None if not enough samples yet.
+    """
+    overlap_needed = window_size - hop_length  # 240
+
+    if len(samples_16k) == 0:
+        return None, state
+
+    if state.is_first_chunk:
+        # Center-pad left side with reflect padding (matches batch mode)
+        pad_size = window_size // 2
+        samples_16k = np.concatenate([
+            np.pad(samples_16k[:pad_size], (pad_size - min(len(samples_16k), pad_size), 0), mode="reflect")
+            if len(samples_16k) < pad_size
+            else np.flip(samples_16k[:pad_size]),
+            samples_16k,
+        ])
+        state.is_first_chunk = False
+    else:
+        # Prepend overlap from previous chunk
+        if len(state.overlap_buffer) > 0:
+            samples_16k = np.concatenate([state.overlap_buffer, samples_16k])
+
+    # Need at least one full window
+    if len(samples_16k) < window_size:
+        state.overlap_buffer = samples_16k
+        return None, state
+
+    # Compute how many complete frames we can produce
+    n_frames = 1 + (len(samples_16k) - window_size) // hop_length
+
+    if n_frames <= 0:
+        state.overlap_buffer = samples_16k
+        return None, state
+
+    # Save overlap for next chunk: the tail that wasn't fully consumed
+    consumed = (n_frames - 1) * hop_length + window_size
+    state.overlap_buffer = samples_16k[n_frames * hop_length:]
+
+    # Periodic Hann window
+    n = mx.arange(window_size, dtype=mx.float32)
+    window = 0.5 * (1.0 - mx.cos(2.0 * math.pi * n / window_size))
+
+    audio = mx.array(samples_16k[:consumed + hop_length] if consumed + hop_length <= len(samples_16k) else samples_16k, dtype=mx.float32)
+
+    # Extract frames and STFT
+    indices = mx.arange(window_size)[None, :] + (mx.arange(n_frames) * hop_length)[:, None]
+    frames = audio[indices] * window[None, :]
+    spectrum = mx.fft.rfft(frames, n=window_size, axis=-1)
+
+    magnitudes = mx.abs(spectrum) ** 2
+    magnitudes = magnitudes.T  # [n_freq, n_frames]
+
+    # Apply mel filter bank
+    mel_spec = mel_filters.T @ magnitudes
+
+    # Log, clamp, scale (same as batch)
+    log_spec = mx.log10(mx.maximum(mel_spec, 1e-10))
+    min_val = global_log_mel_max - 8.0
+    log_spec = mx.maximum(log_spec, min_val)
+    log_spec = (log_spec + 4.0) / 4.0
+
+    return log_spec, state  # [128, frames]

@@ -16,6 +16,7 @@ Optimizations:
 
 import math
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -24,10 +25,10 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import STTOutput
-from .audio import compute_mel_filters, compute_mel_spectrogram
+from .audio import StreamingMelState, compute_mel_filters, compute_mel_spectrogram, compute_mel_streaming
 from .config import ModelConfig
 from .decoder import Decoder, compute_time_embedding
-from .encoder import AudioEncoder
+from .encoder import AudioEncoder, StreamingEncoderState
 from .tokenizer import TekkenTokenizer
 
 
@@ -64,6 +65,27 @@ def _pad_audio_streaming(audio_array, n_left_pad_tokens, n_right_pad_tokens):
     right_pad = align_pad + n_right_pad_tokens * mult_of
     left_pad = n_left_pad_tokens * mult_of
     return np.pad(audio_array, (left_pad, right_pad))
+
+
+@dataclass
+class StreamingSTTSession:
+    """Persistent session for frame-by-frame STT.
+
+    Created via Model.create_streaming_session(). Feed audio chunks
+    with Model.feed_audio() and finalize with Model.finish_session().
+    """
+
+    mel_state: StreamingMelState
+    encoder_state: StreamingEncoderState
+    decoder_cache: Optional[list]  # Decoder KV cache (list of tuples per layer)
+    generated_tokens: list = field(default_factory=list)
+    decoder_position: int = 0  # Current decoder position for RoPE
+    adapter_buffer: list = field(default_factory=list)  # Buffered adapter tokens
+    prompt_built: bool = False  # Whether initial prompt has been prefilled
+    n_delay: int = 0
+    n_left: int = 0
+    prev_text: str = ""
+    finished: bool = False
 
 
 class Model(nn.Module):
@@ -277,6 +299,222 @@ class Model(nn.Module):
     def _sample(self, logits, temperature):
         # categorical accepts unnormalized logits directly — no softmax+log needed
         return int(mx.random.categorical(logits * (1.0 / temperature)).item())
+
+    # --- Streaming audio input API ---
+
+    def supports_streaming_input(self) -> bool:
+        return True
+
+    def create_streaming_session(self, temperature: float = 0.0) -> StreamingSTTSession:
+        """Initialize a new streaming session with empty caches."""
+        n_delay = _num_delay_tokens(self.config.transcription_delay_ms)
+        return StreamingSTTSession(
+            mel_state=StreamingMelState(),
+            encoder_state=self.encoder.init_streaming_state(),
+            decoder_cache=None,
+            n_delay=n_delay,
+            n_left=self.config.n_left_pad_tokens,
+        )
+
+    def feed_audio(
+        self,
+        session: StreamingSTTSession,
+        pcm_16k: Union[bytes, np.ndarray],
+        temperature: float = 0.0,
+    ) -> list:
+        """Feed an audio chunk and return new text pieces (may be empty).
+
+        Args:
+            session: Active streaming session
+            pcm_16k: Raw PCM data. Either:
+                - bytes: PCM Int16 at 16kHz (2 bytes per sample)
+                - np.ndarray: float32 samples at 16kHz
+
+        Returns:
+            List of text strings produced from this chunk (may be empty).
+        """
+        if session.finished:
+            return []
+
+        # Convert input to float32 numpy
+        if isinstance(pcm_16k, bytes):
+            samples = np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            samples = np.asarray(pcm_16k, dtype=np.float32)
+
+        if len(samples) == 0:
+            return []
+
+        # 1. Compute mel for new audio
+        mel_filters = self._ensure_mel_filters()
+        aec = self.config.audio_encoding_args
+        mel_result, session.mel_state = compute_mel_streaming(
+            samples,
+            session.mel_state,
+            mel_filters,
+            window_size=aec.window_size,
+            hop_length=aec.hop_length,
+            global_log_mel_max=aec.global_log_mel_max,
+        )
+
+        if mel_result is None:
+            return []
+
+        # 2. Incrementally encode -> new adapter tokens
+        adapter_tokens, session.encoder_state = self.encoder.forward_streaming(
+            mel_result, session.encoder_state
+        )
+        mx.eval(adapter_tokens)
+
+        if adapter_tokens.shape[0] == 0:
+            return []
+
+        # Buffer adapter tokens
+        for i in range(adapter_tokens.shape[0]):
+            session.adapter_buffer.append(adapter_tokens[i])
+
+        # 3. Build prompt and decode
+        text_pieces = []
+
+        if not session.prompt_built:
+            prompt_len = 1 + session.n_left + session.n_delay
+            if len(session.adapter_buffer) < prompt_len:
+                return []
+
+            # Build the prompt: [BOS] + [STREAMING_PAD] * (n_left + n_delay)
+            prompt_ids = [self.config.bos_token_id] + [
+                self.config.streaming_pad_token_id
+            ] * (session.n_left + session.n_delay)
+            prompt_ids_mx = mx.array(prompt_ids)
+            prompt_text_embeds = self.decoder.embed_tokens(prompt_ids_mx)
+
+            # Combine audio + text embeddings for prompt
+            adapter_stack = mx.stack(session.adapter_buffer[:prompt_len])
+            prefix_embeds = adapter_stack + prompt_text_embeds
+
+            # Prefill decoder with prompt
+            if prompt_len > 1:
+                h, cache = self.decoder.forward(prefix_embeds[:-1], start_pos=0)
+            else:
+                cache = None
+
+            h, cache = self.decoder.forward(
+                prefix_embeds[-1:], start_pos=prompt_len - 1, cache=cache
+            )
+            logits = self.decoder.logits(h.squeeze(0))
+            cache_arrays = [t for lc in cache for t in lc[:2]]
+            mx.eval(logits, *cache_arrays)
+
+            token = int(mx.argmax(logits).item()) if temperature == 0 else self._sample(logits, temperature)
+            session.generated_tokens.append(token)
+            session.decoder_cache = cache
+            session.decoder_position = prompt_len
+            session.prompt_built = True
+
+            # Yield text delta
+            text_so_far = self._tokenizer.decode(
+                [t for t in session.generated_tokens if t != self.config.eos_token_id]
+            )
+            if text_so_far != session.prev_text:
+                text_pieces.append(text_so_far[len(session.prev_text):])
+                session.prev_text = text_so_far
+
+            # Remove consumed prompt tokens but keep remaining
+            session.adapter_buffer = session.adapter_buffer[prompt_len:]
+
+        # Decode one step per remaining adapter token
+        for adapter_tok in session.adapter_buffer:
+            if session.generated_tokens and session.generated_tokens[-1] == self.config.eos_token_id:
+                session.finished = True
+                break
+
+            last_token = session.generated_tokens[-1] if session.generated_tokens else self.config.bos_token_id
+            embed = adapter_tok + self.decoder.embed_token(last_token)
+            h, session.decoder_cache = self.decoder.forward(
+                embed[None, :],
+                start_pos=session.decoder_position,
+                cache=session.decoder_cache,
+            )
+            logits = self.decoder.logits(h.squeeze(0))
+            token = int(mx.argmax(logits).item()) if temperature == 0 else self._sample(logits, temperature)
+            session.generated_tokens.append(token)
+            session.decoder_position += 1
+
+            # Yield text delta
+            text_so_far = self._tokenizer.decode(
+                [t for t in session.generated_tokens if t != self.config.eos_token_id]
+            )
+            if text_so_far != session.prev_text:
+                text_pieces.append(text_so_far[len(session.prev_text):])
+                session.prev_text = text_so_far
+
+        session.adapter_buffer = []
+        return text_pieces
+
+    def finish_session(self, session: StreamingSTTSession) -> str:
+        """Flush remaining buffers and return final transcript.
+
+        Processes any remaining audio in the mel overlap buffer and
+        downsample buffer, then returns the complete text.
+        """
+        if not session.prompt_built:
+            # Not enough audio was provided to even build the prompt
+            return ""
+
+        # Flush mel overlap buffer with zero-padding to complete final frame
+        if len(session.mel_state.overlap_buffer) > 0:
+            aec = self.config.audio_encoding_args
+            # Pad with zeros to complete at least one more frame
+            pad_needed = aec.window_size - len(session.mel_state.overlap_buffer)
+            if pad_needed > 0:
+                padded = np.concatenate([
+                    session.mel_state.overlap_buffer,
+                    np.zeros(pad_needed, dtype=np.float32)
+                ])
+            else:
+                padded = session.mel_state.overlap_buffer
+            self.feed_audio(session, padded, temperature=0.0)
+
+        # Flush downsample buffer by zero-padding
+        if session.encoder_state.downsample_buffer is not None:
+            ds = session.encoder_state.downsample_buffer
+            remainder = ds.shape[0]
+            ds_factor = self.encoder.config.downsample_factor
+            if remainder > 0:
+                pad_frames = ds_factor - remainder
+                padded = mx.concatenate([
+                    ds,
+                    mx.zeros((pad_frames, ds.shape[1]))
+                ], axis=0)
+                ds_input = padded.reshape(1, self.encoder.config.dim * ds_factor)
+                adapter_out = nn.gelu(self.encoder.audio_language_projection_0(ds_input))
+                adapter_out = self.encoder.audio_language_projection_2(adapter_out)
+                mx.eval(adapter_out)
+
+                # Decode the final adapter token
+                if session.generated_tokens and session.generated_tokens[-1] != self.config.eos_token_id:
+                    last_token = session.generated_tokens[-1]
+                    embed = adapter_out[0] + self.decoder.embed_token(last_token)
+                    h, session.decoder_cache = self.decoder.forward(
+                        embed[None, :],
+                        start_pos=session.decoder_position,
+                        cache=session.decoder_cache,
+                    )
+                    logits = self.decoder.logits(h.squeeze(0))
+                    token = int(mx.argmax(logits).item())
+                    session.generated_tokens.append(token)
+                    session.decoder_position += 1
+
+                session.encoder_state.downsample_buffer = None
+
+        # Remove EOS tokens and decode final text
+        final_tokens = [t for t in session.generated_tokens if t != self.config.eos_token_id]
+        text = self._tokenizer.decode(final_tokens).strip() if final_tokens else ""
+
+        session.finished = True
+        mx.clear_cache()
+
+        return text
 
     def sanitize(self, weights):
         """Map weight names from consolidated.safetensors to our module structure."""

@@ -15,6 +15,8 @@ Optimizations:
 """
 
 import math
+from dataclasses import dataclass, field
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -230,3 +232,222 @@ class AudioEncoder(nn.Module):
         x = self.audio_language_projection_2(x)
 
         return x  # [seq/4, decoder_dim]
+
+    def init_streaming_state(self) -> "StreamingEncoderState":
+        """Create initial streaming state with empty caches."""
+        return StreamingEncoderState(
+            conv0_cache=None,
+            conv1_cache=None,
+            kv_caches=[None] * self.config.n_layers,
+            downsample_buffer=None,
+            position=0,
+        )
+
+    def forward_streaming(
+        self,
+        mel_chunk: mx.array,
+        state: "StreamingEncoderState",
+    ) -> tuple:
+        """Process a small mel chunk incrementally.
+
+        Args:
+            mel_chunk: [mel_bins, frames] — small mel chunk
+            state: StreamingEncoderState with conv/KV/downsample caches
+
+        Returns:
+            (adapter_tokens, updated_state) where adapter_tokens is
+            [n_new_tokens, decoder_dim] (may be empty if downsample
+            buffer not yet full).
+        """
+        if mel_chunk.shape[1] == 0:
+            return mx.zeros((0, 3072)), state
+
+        # mel is [128, frames], transpose to [frames, 128]
+        x = mel_chunk.T  # [frames, 128]
+        x = x[None, :, :]  # [1, frames, 128]
+
+        # --- Conv stem with streaming caches ---
+        # Conv0: kernel=3, stride=1, padding=2 (kernel-stride)
+        x, state.conv0_cache = self._stream_causal_conv(
+            self.conv_layers_0_conv, x, state.conv0_cache
+        )
+        x = nn.gelu(x)
+
+        # Conv1: kernel=3, stride=2, padding=1 (kernel-stride)
+        x, state.conv1_cache = self._stream_causal_conv(
+            self.conv_layers_1_conv, x, state.conv1_cache
+        )
+        x = nn.gelu(x)
+
+        x = x.squeeze(0)  # [seq, 1280]
+        seq_len = x.shape[0]
+
+        if seq_len == 0:
+            return mx.zeros((0, 3072)), state
+
+        # --- Transformer layers with KV cache ---
+        positions = mx.arange(state.position, state.position + seq_len)
+        rope_cos, rope_sin = _compute_rope_freqs(
+            positions, self.config.head_dim, self.config.rope_theta
+        )
+
+        new_kv_caches = []
+        for i, layer in enumerate(self.transformer_layers):
+            x, kv = self._stream_encoder_layer(
+                layer, x, rope_cos, rope_sin, state.kv_caches[i]
+            )
+            new_kv_caches.append(kv)
+
+        state.kv_caches = new_kv_caches
+        state.position += seq_len
+
+        # Final norm
+        x = self.transformer_norm(x)
+
+        # --- 4x downsample with buffer ---
+        if state.downsample_buffer is not None:
+            x = mx.concatenate([state.downsample_buffer, x], axis=0)
+
+        total = x.shape[0]
+        ds_factor = self.config.downsample_factor
+        n_complete = total // ds_factor
+        remainder = total % ds_factor
+
+        if n_complete == 0:
+            state.downsample_buffer = x
+            return mx.zeros((0, 3072)), state
+
+        # Process complete groups
+        usable = n_complete * ds_factor
+        ds_input = x[:usable].reshape(n_complete, self.config.dim * ds_factor)
+
+        # Save remainder for next call
+        state.downsample_buffer = x[usable:] if remainder > 0 else None
+
+        # Adapter MLP (pointwise, no sequence dependency)
+        adapter_out = nn.gelu(self.audio_language_projection_0(ds_input))
+        adapter_out = self.audio_language_projection_2(adapter_out)
+
+        return adapter_out, state  # [n_new_tokens, decoder_dim]
+
+    @staticmethod
+    def _stream_causal_conv(conv_module, x, cache):
+        """Run a CausalConv1d incrementally with a left-padding cache.
+
+        Args:
+            conv_module: CausalConv1d instance
+            x: [1, seq, channels] input
+            cache: [1, cache_len, channels] or None
+
+        Returns:
+            (output, new_cache)
+        """
+        pad_size = conv_module.padding
+        if cache is not None:
+            x = mx.concatenate([cache, x], axis=1)
+        elif pad_size > 0:
+            # First call: zero-pad left (matches CausalConv1d behavior)
+            x = mx.pad(x, [(0, 0), (pad_size, 0), (0, 0)])
+
+        # Save the tail as cache for next call
+        if pad_size > 0:
+            new_cache = x[:, -pad_size:, :]
+        else:
+            new_cache = None
+
+        # Run the raw conv (skip CausalConv1d's own padding by calling conv directly)
+        out = conv_module.conv(x)
+        return out, new_cache
+
+    @staticmethod
+    def _stream_encoder_layer(layer, x, rope_cos, rope_sin, kv_cache):
+        """Run one encoder layer with KV cache for streaming.
+
+        Args:
+            layer: EncoderLayer
+            x: [seq, dim] new input
+            rope_cos, rope_sin: [seq, head_dim//2] for new positions
+            kv_cache: (k_cache, v_cache) or None
+
+        Returns:
+            (output, new_kv_cache)
+        """
+        attn = layer.attention
+        seq_len = x.shape[0]
+
+        # Attention with KV cache
+        h = layer.attention_norm(x)
+        q = attn.wq(h)
+        k = attn.wk(h)
+        v = attn.wv(h)
+
+        # RoPE on new positions only
+        q = _interleaved_rope(q, rope_cos, rope_sin, attn.n_heads, attn.head_dim)
+        k = _interleaved_rope(k, rope_cos, rope_sin, attn.n_heads, attn.head_dim)
+
+        # Append to KV cache
+        if kv_cache is not None:
+            k_old, v_old = kv_cache
+            k_full = mx.concatenate([k_old, k], axis=0)
+            v_full = mx.concatenate([v_old, v], axis=0)
+        else:
+            k_full = k
+            v_full = v
+
+        kv_len = k_full.shape[0]
+
+        # Trim to sliding window
+        if kv_len > attn.sliding_window:
+            trim = kv_len - attn.sliding_window
+            k_full = k_full[trim:]
+            v_full = v_full[trim:]
+            kv_len = attn.sliding_window
+
+        # Save cache (2D, before reshape)
+        new_kv = (k_full, v_full)
+
+        # Reshape for attention
+        q4 = q.reshape(1, seq_len, attn.n_heads, attn.head_dim).transpose(0, 2, 1, 3)
+        k4 = k_full.reshape(1, kv_len, attn.n_heads, attn.head_dim).transpose(0, 2, 1, 3)
+        v4 = v_full.reshape(1, kv_len, attn.n_heads, attn.head_dim).transpose(0, 2, 1, 3)
+
+        scale = 1.0 / math.sqrt(attn.head_dim)
+
+        # Mask: causal sliding window for new queries against full KV
+        if seq_len == 1 and kv_len <= attn.sliding_window:
+            mask = None
+        else:
+            # q positions are the last seq_len positions in the sequence
+            total_seen = kv_len  # total KV positions after trim
+            q_offset = total_seen - seq_len
+            qi = mx.arange(q_offset, total_seen)[:, None]
+            ki = mx.arange(total_seen)[None, :]
+            causal = ki <= qi
+            window = ki >= (qi - attn.sliding_window + 1)
+            mask = mx.where(causal & window, mx.array(0.0), mx.array(-1e9))
+
+        attn_out = mx.fast.scaled_dot_product_attention(
+            q4, k4, v4, scale=scale, mask=mask
+        )
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(seq_len, attn.n_heads * attn.head_dim)
+        h = attn.wo(attn_out)
+        x = x + h
+
+        # SwiGLU FFN
+        h = layer.ffn_norm(x)
+        gate = nn.silu(layer.feed_forward_w1(h))
+        up = layer.feed_forward_w3(h)
+        x = x + layer.feed_forward_w2(gate * up)
+
+        return x, new_kv
+
+
+@dataclass
+class StreamingEncoderState:
+    """Persistent state for incremental audio encoding."""
+
+    conv0_cache: Optional[mx.array]
+    conv1_cache: Optional[mx.array]
+    kv_caches: list  # Per-layer (k, v) tuples or None
+    downsample_buffer: Optional[mx.array]
+    position: int
