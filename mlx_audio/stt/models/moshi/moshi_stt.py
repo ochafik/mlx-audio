@@ -243,11 +243,21 @@ class Model(nn.Module):
 
         Args:
             audio: Audio file path, numpy array, or MLX array (float32 at 24kHz).
-            stream: If True, yield text deltas as they're generated.
+            stream: If True, return a generator that yields text deltas.
 
         Returns:
-            STTOutput with transcription results.
+            STTOutput with transcription results (or generator if stream=True).
         """
+        if stream:
+            return self._generate_stream(audio, **kwargs)
+        return self._generate_batch(audio, **kwargs)
+
+    def _generate_batch(
+        self,
+        audio: Union[str, np.ndarray, mx.array],
+        **kwargs,
+    ) -> STTOutput:
+        """Non-streaming batch transcription."""
         # Load audio if path provided
         if isinstance(audio, str):
             import sphn
@@ -288,7 +298,6 @@ class Model(nn.Module):
         self._mimi.reset_all()
         all_codes = self._mimi.encode(pcm_tensor)  # (1, codebooks, num_frames)
         mx.eval(all_codes)
-        encode_time = time.time() - start_time
 
         # Slice to other_codebooks
         all_codes = all_codes[:, : self._other_codebooks, :]
@@ -307,7 +316,96 @@ class Model(nn.Module):
         )
 
         text_tokens = []
-        lm_start = time.time()
+
+        for idx in range(num_frames):
+            other_audio_tokens = all_codes[:, :, idx]
+
+            text_token, _ = gen.step(
+                other_audio_tokens[0],
+                ct=self._condition_tensor,
+                depformer_replace_tokens=self._silence_replace,
+            )
+
+            text_token_val = text_token[0].item()
+
+            if text_token_val not in (0, 3):
+                text_tokens.append(int(text_token_val))
+
+        elapsed = time.time() - start_time
+
+        final_text = ""
+        if text_tokens:
+            final_text = self._tokenizer.decode(text_tokens).strip()
+
+        return STTOutput(
+            text=final_text,
+            total_time=elapsed,
+        )
+
+    def _generate_stream(
+        self,
+        audio: Union[str, np.ndarray, mx.array],
+        **kwargs,
+    ):
+        """Streaming batch transcription - yields text deltas."""
+        # Load audio if path provided
+        if isinstance(audio, str):
+            import sphn
+            audio, _ = sphn.read(audio, sample_rate=SAMPLE_RATE)
+            audio = audio[0].astype(np.float32)
+        elif isinstance(audio, mx.array):
+            audio = np.array(audio)
+
+        # Ensure float32
+        audio = audio.astype(np.float32)
+
+        orig_duration = len(audio) / SAMPLE_RATE
+
+        # Apply STT padding
+        if self._stt_config:
+            pad_left = int(
+                self._stt_config.get("audio_silence_prefix_seconds", 0.0) * SAMPLE_RATE
+            )
+            pad_right = int(
+                (self._stt_config.get("audio_delay_seconds", 0.0) + 1.0) * SAMPLE_RATE
+            )
+            audio = np.pad(audio, (pad_left, pad_right), mode="constant")
+
+        # Pad to frame boundary
+        remainder = len(audio) % FRAME_SIZE
+        if remainder > 0:
+            audio = np.concatenate(
+                [audio, np.zeros(FRAME_SIZE - remainder, dtype=np.float32)]
+            )
+
+        num_frames = len(audio) // FRAME_SIZE
+        max_steps = num_frames + 10
+
+        start_time = time.time()
+
+        # Phase 1: Batch encode all audio
+        pcm_tensor = mx.array(audio[np.newaxis, np.newaxis, :])  # (1, 1, T)
+        self._mimi.reset_all()
+        all_codes = self._mimi.encode(pcm_tensor)  # (1, codebooks, num_frames)
+        mx.eval(all_codes)
+
+        # Slice to other_codebooks
+        all_codes = all_codes[:, : self._other_codebooks, :]
+
+        # Phase 2: Run LM step loop
+        for c in self._lm.transformer_cache:
+            c.reset()
+
+        gen = self._lm_gen_class(
+            model=self._lm,
+            max_steps=max_steps,
+            text_sampler=self._sampler_class(temp=self._text_temp, top_k=self._text_top_k),
+            audio_sampler=self._sampler_class(temp=0.8, top_k=250),
+            cfg_coef=1.0,
+            check=False,
+        )
+
+        text_tokens = []
         prev_text = ""
 
         for idx in range(num_frames):
@@ -324,33 +422,25 @@ class Model(nn.Module):
             if text_token_val not in (0, 3):
                 text_tokens.append(int(text_token_val))
 
-            # Stream text deltas if requested
-            if stream:
-                current_text = self._tokenizer.decode(text_tokens) if text_tokens else ""
-                if current_text != prev_text:
-                    delta = current_text[len(prev_text):]
-                    if delta:
-                        yield STTOutput(text=delta)
-                    prev_text = current_text
+            # Yield text deltas
+            current_text = self._tokenizer.decode(text_tokens) if text_tokens else ""
+            if current_text != prev_text:
+                delta = current_text[len(prev_text):]
+                if delta:
+                    yield STTOutput(text=delta)
+                prev_text = current_text
 
-        lm_time = time.time() - lm_start
         elapsed = time.time() - start_time
 
         final_text = ""
         if text_tokens:
             final_text = self._tokenizer.decode(text_tokens).strip()
 
-        if stream:
-            # Yield final result with stats
-            yield STTOutput(
-                text=final_text,
-                total_time=elapsed,
-            )
-        else:
-            return STTOutput(
-                text=final_text,
-                total_time=elapsed,
-            )
+        # Yield final result with stats
+        yield STTOutput(
+            text=final_text,
+            total_time=elapsed,
+        )
 
     def create_streaming_session(self, **kwargs) -> StreamingMoshiSession:
         """Create a new streaming session.
