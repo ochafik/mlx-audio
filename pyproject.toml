@@ -57,6 +57,14 @@ server = [
     "python-multipart>=0.0.22"
 ]
 
+# Moshi STT/TTS dependencies
+moshi = [
+    "moshi-mlx>=0.3.0",
+    "moshi-stt-mlx>=0.1.0",
+    "sentencepiece>=0.2.0",
+    "sphn>=0.1.0",
+]
+
 # STS (Speech-to-Speech) requires both STT and TTS + additional deps
 sts = [
     "tiktoken>=0.9.0",
@@ -88,6 +96,10 @@ all = [
     "uvicorn>=0.22.0",
 
     "webrtcvad>=2.0.10",
+
+    "moshi-mlx>=0.3.0",
+    "moshi-stt-mlx>=0.1.0",
+    "sphn>=0.1.0",
 ]
 
 # Development dependencies

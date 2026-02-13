@@ -364,6 +364,16 @@ def base_load_model(
     if model_type is None:
         model_type = model_name[0].lower() if model_name is not None else None
 
+    # Config-based detection for models without explicit model_type
+    if model_type is None or (model_type not in model_remapping and model_type not in ["whisper", "parakeet", "wav2vec"]):
+        # Detect Moshi STT models by config signature
+        if "dep_q" in config and "delays" in config:
+            if "tts_config" not in config:  # STT, not TTS
+                model_type = "moshi"
+        # Detect Moshi TTS models
+        elif "tts_config" in config and "delays" in config:
+            model_type = "moshi_tts"
+
     model_class, model_type = get_model_class(
         model_type=model_type,
         model_name=model_name,

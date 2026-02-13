@@ -15,6 +15,9 @@ MODEL_REMAPPING = {
     "voxtral_realtime": "voxtral_realtime",
     "vibevoice": "vibevoice_asr",
     "qwen3_asr": "qwen3_asr",
+    "moshi": "moshi",
+    "moshi_stt": "moshi",
+    "stt": "moshi",  # kyutai/stt-* repos
 }
 
 
