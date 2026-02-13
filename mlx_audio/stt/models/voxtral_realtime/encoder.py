@@ -120,12 +120,12 @@ class EncoderAttention(nn.Module):
             k, v = cache.update_and_fetch(k, v)
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn_out = mx.fast.scaled_dot_product_attention(
-            q, k, v, scale=scale, mask=mask
-        )
+        attn_out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
         # Reshape back: [1, n_heads, seq, head_dim] -> [seq, n_heads * head_dim]
-        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(seq_len, self.n_heads * self.head_dim)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(
+            seq_len, self.n_heads * self.head_dim
+        )
         return self.wo(attn_out)
 
 
@@ -167,7 +167,9 @@ class AudioEncoder(nn.Module):
 
         # Conv stem
         self.conv_layers_0_conv = CausalConv1d(128, config.dim, kernel_size=3, stride=1)
-        self.conv_layers_1_conv = CausalConv1d(config.dim, config.dim, kernel_size=3, stride=2)
+        self.conv_layers_1_conv = CausalConv1d(
+            config.dim, config.dim, kernel_size=3, stride=2
+        )
 
         # Transformer layers
         self.transformer_layers = [EncoderLayer(config) for _ in range(config.n_layers)]
@@ -252,9 +254,32 @@ class AudioEncoder(nn.Module):
         ds_len = seq_len // ds
         if ds_len == 0:
             return encoded[:0]  # empty
-        x = encoded[:ds_len * ds].reshape(ds_len, self.config.dim * ds)
+        x = encoded[: ds_len * ds].reshape(ds_len, self.config.dim * ds)
         x = nn.gelu(self.audio_language_projection_0(x))
         return self.audio_language_projection_2(x)
+
+    def encode_full(self, conv_out):
+        """Non-chunked encoding of conv output using optimized causal attention.
+
+        Uses SDPA's native causal mask ("causal" string) which enables Flash
+        Attention. Only valid when conv_out fits within the sliding window.
+
+        Args:
+            conv_out: [seq, dim] output from conv_stem()
+
+        Returns:
+            mx.array: [seq/4, decoder_dim] adapter output
+        """
+        seq_len = conv_out.shape[0]
+        positions = mx.arange(seq_len)
+        rope_cos, rope_sin = _compute_rope_freqs(
+            positions, self.config.head_dim, self.config.rope_theta
+        )
+        x = conv_out
+        for layer in self.transformer_layers:
+            x = layer(x, rope_cos, rope_sin, "causal")
+        x = self.transformer_norm(x)
+        return self.downsample_and_project(x)
 
     def __call__(self, mel):
         """Full encode: conv stem + all transformer layers + downsample + project.
@@ -271,19 +296,11 @@ class AudioEncoder(nn.Module):
 
         # Short sequences: process in one pass (no chunking needed)
         if seq_len <= sw:
-            positions = mx.arange(seq_len)
-            rope_cos, rope_sin = _compute_rope_freqs(
-                positions, self.config.head_dim, self.config.rope_theta
-            )
-            x = conv_out
-            for layer in self.transformer_layers:
-                x = layer(x, rope_cos, rope_sin, "causal")
-            x = self.transformer_norm(x)
+            return self.encode_full(conv_out)
         else:
             # Long sequences: use chunked encoding
             x = mx.concatenate(list(self.encode_chunks(conv_out)), axis=0)
-
-        return self.downsample_and_project(x)
+            return self.downsample_and_project(x)
 
     def init_streaming_state(self) -> "StreamingEncoderState":
         """Create initial streaming state with empty caches."""
