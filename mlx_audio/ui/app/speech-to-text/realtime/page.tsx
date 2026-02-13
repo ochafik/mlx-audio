@@ -162,16 +162,26 @@ export default function RealtimeTranscriptionPage() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
-          if (data.status === "ready") {
-            setStatus("ready")
-            setIsRecording(true)
-            setStatus("recording")
-            // Start processing audio stream
-            startAudioProcessing(stream, audioContext, ws)
+
+          // Handle status messages
+          if (data.type === "status") {
+            if (data.status === "ready") {
+              setStatus("ready")
+              setIsRecording(true)
+              setStatus("recording")
+              // Log streaming input capability
+              console.log("Streaming input support:", data.streaming_input)
+              // Start processing audio stream
+              startAudioProcessing(stream, audioContext, ws)
+            } else if (data.status === "reset") {
+              // Session was reset, clear streaming text
+              setStreamingText("")
+              pendingStreamResetRef.current = false
+            }
             return
           }
 
-          if (data.error) {
+          if (data.type === "error") {
             setError(data.error)
             setStatus("error")
             return
@@ -191,8 +201,6 @@ export default function RealtimeTranscriptionPage() {
 
           if (data.type === "delta") {
             // Streaming delta: accumulate in-progress text
-            // Suppress deltas during the final re-transcription round;
-            // the partial text stays visible until the final complete swaps it.
             if (!pendingStreamResetRef.current) {
               setStreamingText((prev) => prev + (data.delta || ""))
             }
@@ -210,17 +218,12 @@ export default function RealtimeTranscriptionPage() {
             }
             flashSpeech()
           } else if (data.text) {
-            // Legacy fallback for non-streaming models
-            // Handle transcription (partial or final)
+            // Legacy fallback for very old clients
             const text = data.text.trim()
 
             if (data.is_partial) {
-              // Partial transcription - append (it will be replaced by final transcription)
               appendToTranscript(text)
             } else {
-              // Final transcription - replace the last partial if exists, or append
-              // If we have a previous partial transcription, try to replace it
-              // Estimate: partial is usually ~1.5 seconds, roughly 3-4 words
               setTranscript((prev) => {
                 if (!prev || prev.trim().length === 0) return text
 

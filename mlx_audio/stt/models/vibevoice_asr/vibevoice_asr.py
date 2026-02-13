@@ -113,6 +113,16 @@ class StreamingVibeVoiceSession:
     total_audio_samples: int = 0
     finished: bool = False
 
+    def reset(self):
+        """Reset session state for a new utterance."""
+        self.acoustic_caches = None
+        self.semantic_caches = None
+        self.acoustic_features = []
+        self.semantic_features = []
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.total_audio_samples = 0
+        self.finished = False
+
 
 class Model(nn.Module):
     """
@@ -464,6 +474,16 @@ class Model(nn.Module):
 
         text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
         return text.strip()
+
+    def reset_session(self, session: StreamingVibeVoiceSession) -> None:
+        """Reset session state for a new utterance.
+
+        This allows reusing the session object without creating a new one.
+
+        Args:
+            session: Session object to reset
+        """
+        session.reset()
 
     @staticmethod
     def sanitize(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

@@ -503,6 +503,16 @@ class LasrForCTC(nn.Module):
 
         return results
 
+    def reset_session(self, session: "StreamingLasrSession") -> None:
+        """Reset session state for a new utterance.
+
+        This allows reusing the session object without creating a new one.
+
+        Args:
+            session: Session object to reset
+        """
+        session.reset()
+
     def _process_chunk(
         self, audio_chunk: np.ndarray, session: "StreamingLasrSession"
     ) -> list:
@@ -645,3 +655,9 @@ class StreamingLasrSession:
     )
     prev_chunk_tokens: list = field(default_factory=list)
     finished: bool = False
+
+    def reset(self):
+        """Reset session state for a new utterance."""
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.prev_chunk_tokens = []
+        self.finished = False

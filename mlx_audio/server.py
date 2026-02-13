@@ -526,7 +526,7 @@ async def _stream_transcription(
     ``{"type": "complete", ...}`` message.
 
     Non-streaming models fall back to temp-file + batch generate, sending the
-    legacy ``{"text": ..., "is_partial": ...}`` format.
+    standardized ``{"type": "complete", "text": ..., "is_partial": ...}`` format.
     """
     supports_stream = "stream" in inspect.signature(stt_model.generate).parameters
     lang_arg = language if language and language != "Detect" else None
@@ -564,6 +564,7 @@ async def _stream_transcription(
             )
             await websocket.send_json(
                 {
+                    "type": "complete",
                     "text": result.text,
                     "segments": segments,
                     "language": getattr(result, "language", language),
@@ -575,9 +576,279 @@ async def _stream_transcription(
                 os.remove(tmp_path)
 
 
+def _supports_streaming_input(model) -> bool:
+    """Check if model supports native streaming audio input."""
+    return (
+        hasattr(model, "supports_streaming_input")
+        and callable(model.supports_streaming_input)
+        and model.supports_streaming_input()
+    )
+
+
+async def _handle_native_streaming(
+    websocket: WebSocket,
+    stt_model,
+    sample_rate: int,
+):
+    """Handle realtime transcription using native streaming input API.
+
+    For models that implement StreamingInputModel protocol (Voxtral Realtime,
+    VibeVoice-ASR, LASR-CTC), this uses feed_audio() for true frame-by-frame
+    processing without VAD-based chunking.
+    """
+    from mlx_audio.stt.models.base import StreamingInputModel
+
+    session = stt_model.create_streaming_session()
+    accumulated_text = ""
+
+    try:
+        while True:
+            message = await websocket.receive()
+
+            if "bytes" in message:
+                # Audio data received as int16 PCM
+                audio_chunk = message["bytes"]
+
+                try:
+                    # Feed audio to streaming session
+                    text_pieces = stt_model.feed_audio(session, audio_chunk)
+
+                    # Send any text deltas
+                    for text in text_pieces:
+                        accumulated_text += text
+                        await websocket.send_json({
+                            "type": "delta",
+                            "delta": text,
+                        })
+
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    await websocket.send_json({
+                        "type": "error",
+                        "error": str(e),
+                    })
+
+            elif "text" in message:
+                try:
+                    data = json.loads(message["text"])
+
+                    if data.get("action") == "stop":
+                        # Finalize and send complete
+                        final_text = stt_model.finish_session(session)
+                        if final_text and final_text != accumulated_text:
+                            # Send any remaining text
+                            remaining = final_text[len(accumulated_text):]
+                            if remaining:
+                                await websocket.send_json({
+                                    "type": "delta",
+                                    "delta": remaining,
+                                })
+                        await websocket.send_json({
+                            "type": "complete",
+                            "text": final_text or accumulated_text,
+                            "is_partial": False,
+                        })
+                        break
+
+                    elif data.get("action") == "reset":
+                        # Reset session for new utterance
+                        stt_model.reset_session(session)
+                        accumulated_text = ""
+                        await websocket.send_json({
+                            "type": "status",
+                            "status": "reset",
+                        })
+
+                except json.JSONDecodeError:
+                    pass
+
+    except WebSocketDisconnect:
+        # Try to finalize on disconnect
+        try:
+            final_text = stt_model.finish_session(session)
+            if final_text:
+                await websocket.send_json({
+                    "type": "complete",
+                    "text": final_text,
+                    "is_partial": False,
+                })
+        except:
+            pass
+
+
+async def _handle_vad_streaming(
+    websocket: WebSocket,
+    stt_model,
+    sample_rate: int,
+    language: Optional[str],
+    streaming: bool,
+):
+    """Handle realtime transcription using VAD-based chunking.
+
+    Fallback for models that don't support native streaming input.
+    Uses WebRTC VAD to detect speech and accumulate audio chunks.
+    """
+    # Initialize WebRTC VAD for speech detection
+    vad = webrtcvad.Vad(3)  # Mode 3 is most aggressive
+    vad_frame_duration_ms = 30
+    vad_frame_size = int(sample_rate * vad_frame_duration_ms / 1000)
+
+    # Buffer for accumulating audio chunks with speech
+    audio_buffer = []
+    min_chunk_size = int(sample_rate * 0.5)
+    initial_chunk_size = int(sample_rate * 1.5)
+    max_chunk_size = int(sample_rate * 5.0)
+    silence_skip_count = 0
+    speech_chunk_count = 0
+    last_speech_time = time.time()
+    silence_threshold_seconds = 0.5
+    initial_chunk_processed = False
+
+    print(f"VAD streaming mode: frame_size={vad_frame_size} samples")
+
+    try:
+        while True:
+            message = await websocket.receive()
+
+            if "bytes" in message:
+                audio_chunk_int16 = np.frombuffer(message["bytes"], dtype=np.int16)
+
+                # VAD speech detection
+                num_frames = len(audio_chunk_int16) // vad_frame_size
+                has_speech = False
+                speech_frames = 0
+
+                for i in range(num_frames):
+                    frame_start = i * vad_frame_size
+                    frame_end = frame_start + vad_frame_size
+                    frame = audio_chunk_int16[frame_start:frame_end]
+
+                    if len(frame) == vad_frame_size:
+                        try:
+                            if vad.is_speech(frame.tobytes(), sample_rate):
+                                has_speech = True
+                                speech_frames += 1
+                        except (ValueError, OSError):
+                            has_speech = True
+                            speech_frames += 1
+
+                current_time = time.time()
+                if has_speech:
+                    audio_chunk_float = audio_chunk_int16.astype(np.float32) / 32768.0
+                    audio_buffer.extend(audio_chunk_float)
+                    speech_chunk_count += 1
+                    silence_skip_count = 0
+                    last_speech_time = current_time
+
+                    if len(audio_buffer) % (sample_rate * 2) < len(audio_chunk_float):
+                        print(
+                            f"Speech: {speech_frames}/{num_frames} frames, "
+                            f"buffer {len(audio_buffer)/sample_rate:.2f}s"
+                        )
+                else:
+                    silence_skip_count += 1
+
+                # Determine if we should process
+                time_since_last_speech = current_time - last_speech_time
+                should_process_initial = False
+                should_process_final = False
+
+                if len(audio_buffer) > 0:
+                    if (
+                        not initial_chunk_processed
+                        and len(audio_buffer) >= initial_chunk_size
+                        and has_speech
+                    ):
+                        should_process_initial = True
+                    elif (
+                        time_since_last_speech >= silence_threshold_seconds
+                        and len(audio_buffer) >= min_chunk_size
+                    ):
+                        should_process_final = True
+                    elif len(audio_buffer) >= max_chunk_size:
+                        should_process_final = True
+
+                # Process initial chunk for real-time feedback
+                if should_process_initial and len(audio_buffer) >= initial_chunk_size:
+                    audio_array = np.array(audio_buffer[:initial_chunk_size])
+                    initial_chunk_processed = True
+
+                    try:
+                        await _stream_transcription(
+                            websocket, stt_model, audio_array, sample_rate,
+                            language, is_partial=True, streaming=streaming,
+                        )
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": str(e),
+                        })
+
+                # Process final chunk
+                if should_process_final and len(audio_buffer) > 0:
+                    audio_array = np.array(audio_buffer)
+
+                    try:
+                        await _stream_transcription(
+                            websocket, stt_model, audio_array, sample_rate,
+                            language, is_partial=False, streaming=streaming,
+                        )
+                        audio_buffer = []
+                        initial_chunk_processed = False
+                        print(f"Processed: {len(audio_array)/sample_rate:.2f}s")
+
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": str(e),
+                        })
+
+            elif "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                    if data.get("action") == "stop":
+                        # Process any remaining buffer
+                        if len(audio_buffer) > min_chunk_size:
+                            audio_array = np.array(audio_buffer)
+                            try:
+                                await _stream_transcription(
+                                    websocket, stt_model, audio_array, sample_rate,
+                                    language, is_partial=False, streaming=streaming,
+                                )
+                            except:
+                                pass
+                        break
+                except:
+                    pass
+
+    except WebSocketDisconnect:
+        pass
+
+
 @app.websocket("/v1/audio/transcriptions/realtime")
 async def stt_realtime_transcriptions(websocket: WebSocket):
-    """Realtime transcription via WebSocket."""
+    """Realtime transcription via WebSocket.
+
+    Protocol:
+    - Client sends JSON config first: {model, language, sample_rate, streaming}
+    - Server responds with {type: "status", status: "ready"}
+    - Client sends binary int16 PCM audio chunks
+    - Server sends {type: "delta", delta: "..."} for streaming text
+    - Server sends {type: "complete", text: "...", is_partial: bool} for results
+    - Client sends {action: "stop"} to end session
+    - Client sends {action: "reset"} to reset for new utterance (streaming input only)
+
+    Two modes:
+    1. Native streaming input: For models implementing StreamingInputModel
+       (Voxtral Realtime, VibeVoice-ASR, LASR-CTC). True frame-by-frame processing.
+    2. VAD-based chunking: For other models. Uses WebRTC VAD to detect speech
+       and process in chunks.
+    """
     await websocket.accept()
 
     try:
@@ -591,7 +862,8 @@ async def stt_realtime_transcriptions(websocket: WebSocket):
         streaming = config.get("streaming", True)
 
         print(
-            f"Configuration received: model={model_name}, language={language}, sample_rate={sample_rate}, streaming={streaming}"
+            f"Config: model={model_name}, language={language}, "
+            f"sample_rate={sample_rate}, streaming={streaming}"
         )
 
         # Load the STT model
@@ -599,210 +871,37 @@ async def stt_realtime_transcriptions(websocket: WebSocket):
         stt_model = model_provider.load_model(model_name)
         print("STT model loaded successfully")
 
-        # Initialize WebRTC VAD for speech detection
-        vad = webrtcvad.Vad(
-            3
-        )  # Mode 3 is most aggressive (0-3, higher = more aggressive)
-        # VAD requires specific frame sizes: 10ms, 20ms, or 30ms at 8kHz, 16kHz, 32kHz, or 48kHz
-        vad_frame_duration_ms = 30  # 30ms frames
-        vad_frame_size = int(sample_rate * vad_frame_duration_ms / 1000)
-        print(
-            f"VAD initialized: frame_size={vad_frame_size} samples ({vad_frame_duration_ms}ms at {sample_rate}Hz)"
-        )
+        # Check for native streaming input support
+        use_native_streaming = _supports_streaming_input(stt_model)
+        print(f"Native streaming input: {use_native_streaming}")
 
-        # Buffer for accumulating audio chunks with speech
-        audio_buffer = []
-        min_chunk_size = int(sample_rate * 0.5)  # Minimum 0.5 seconds before processing
-        initial_chunk_size = int(
-            sample_rate * 1.5
-        )  # Process first 1.5 seconds for real-time feedback
-        max_chunk_size = int(
-            sample_rate * 5.0
-        )  # Maximum 10 seconds to avoid memory issues
-        silence_skip_count = 0
-        speech_chunk_count = 0
-        last_speech_time = time.time()  # Track when we last detected speech
-        silence_threshold_seconds = 0.5  # Process when silence > 0.5 seconds
-        last_process_time = time.time()
-        initial_chunk_processed = False  # Track if we've processed the initial chunk
-        processed_samples = 0  # Track how many samples we've already processed
+        # Send ready status
+        await websocket.send_json({
+            "type": "status",
+            "status": "ready",
+            "streaming_input": use_native_streaming,
+            "message": "Ready to transcribe",
+        })
 
-        await websocket.send_json({"status": "ready", "message": "Ready to transcribe"})
-        print("Ready to transcribe")
-
-        while True:
-            # Receive message
-            try:
-                message = await websocket.receive()
-            except:
-                break
-
-            if "bytes" in message:
-                # Audio data received as int16
-                audio_chunk_int16 = np.frombuffer(message["bytes"], dtype=np.int16)
-
-                # Process audio in VAD frame sizes to detect speech
-                # WebRTC VAD requires frames of exactly 10ms, 20ms, or 30ms
-                # at sample rates of 8000, 16000, 32000, or 48000 Hz
-                num_frames = len(audio_chunk_int16) // vad_frame_size
-                has_speech = False
-                speech_frames = 0
-
-                # Check each VAD frame for speech activity
-                for i in range(num_frames):
-                    frame_start = i * vad_frame_size
-                    frame_end = frame_start + vad_frame_size
-                    frame = audio_chunk_int16[frame_start:frame_end]
-
-                    # VAD requires exact frame size
-                    if len(frame) == vad_frame_size:
-                        try:
-                            if vad.is_speech(frame.tobytes(), sample_rate):
-                                has_speech = True
-                                speech_frames += 1
-                        except (ValueError, OSError) as e:
-                            # If VAD fails (wrong sample rate or frame size), assume speech (conservative)
-                            # This can happen if sample rate doesn't match VAD requirements
-                            print(f"VAD error (assuming speech): {e}")
-                            has_speech = True
-                            speech_frames += 1
-
-                # Handle remaining samples that don't form a complete frame
-                # These will be processed in the next chunk
-
-                # Only accumulate audio if it contains speech
-                current_time = time.time()
-                if has_speech:
-                    # Convert to float32 for buffer
-                    audio_chunk_float = audio_chunk_int16.astype(np.float32) / 32768.0
-                    audio_buffer.extend(audio_chunk_float)
-                    speech_chunk_count += 1
-                    silence_skip_count = 0
-                    last_speech_time = current_time
-
-                    if len(audio_buffer) % (sample_rate * 2) < len(audio_chunk_float):
-                        # Log every ~2 seconds of buffer
-                        print(
-                            f"Speech detected ({speech_frames}/{num_frames} frames): buffer {len(audio_buffer)} samples ({len(audio_buffer)/sample_rate:.2f}s)"
-                        )
-                else:
-                    silence_skip_count += 1
-                    # Only log silence periodically to reduce noise
-                    if silence_skip_count % 20 == 0:
-                        print(f"Silence detected: skipped {silence_skip_count} chunks")
-
-                # Determine if we should process:
-                # 1. Process initial chunk (first 1.5s) for real-time feedback while accumulating
-                # 2. If we have silence > 0.5 seconds and buffer has speech (end of utterance)
-                # 3. If buffer reaches maximum size (to avoid memory issues)
-                time_since_last_speech = current_time - last_speech_time
-                should_process_initial = False
-                should_process_final = False
-
-                if len(audio_buffer) > 0:
-                    # Process initial chunk for real-time feedback (only once per speech segment)
-                    if (
-                        not initial_chunk_processed
-                        and len(audio_buffer) >= initial_chunk_size
-                        and has_speech  # Only if we're still detecting speech
-                    ):
-                        should_process_initial = True
-                        print(
-                            f"Processing initial chunk for real-time feedback: {initial_chunk_size/sample_rate:.2f}s, total buffer: {len(audio_buffer)/sample_rate:.2f}s"
-                        )
-                    # Process if we have enough silence after speech (end of utterance)
-                    elif (
-                        time_since_last_speech >= silence_threshold_seconds
-                        and len(audio_buffer) >= min_chunk_size
-                    ):
-                        should_process_final = True
-                        print(
-                            f"Processing due to silence gap: {time_since_last_speech:.2f}s silence, buffer: {len(audio_buffer)/sample_rate:.2f}s"
-                        )
-                    # Or if buffer is getting too large (continuous speech)
-                    elif len(audio_buffer) >= max_chunk_size:
-                        should_process_final = True
-                        print(
-                            f"Processing due to max buffer size: {len(audio_buffer)/sample_rate:.2f}s"
-                        )
-
-                # Process initial chunk for real-time feedback
-                if should_process_initial and len(audio_buffer) >= initial_chunk_size:
-                    process_size = initial_chunk_size
-                    audio_array = np.array(audio_buffer[:process_size])
-                    processed_samples = process_size
-                    initial_chunk_processed = True
-
-                    try:
-                        await _stream_transcription(
-                            websocket,
-                            stt_model,
-                            audio_array,
-                            sample_rate,
-                            language,
-                            is_partial=True,
-                            streaming=streaming,
-                        )
-                    except Exception as e:
-                        import traceback
-
-                        error_msg = str(e)
-                        traceback.print_exc()
-                        print(f"Error during initial transcription: {error_msg}")
-                        await websocket.send_json(
-                            {"error": error_msg, "status": "error"}
-                        )
-
-                # Process final chunk (entire accumulated buffer)
-                if should_process_final and len(audio_buffer) > 0:
-                    # Process the entire buffer (continuous speech chunk)
-                    process_size = len(audio_buffer)
-                    audio_array = np.array(audio_buffer)
-
-                    try:
-                        await _stream_transcription(
-                            websocket,
-                            stt_model,
-                            audio_array,
-                            sample_rate,
-                            language,
-                            is_partial=False,
-                            streaming=streaming,
-                        )
-
-                        # Clear processed audio from buffer and reset state
-                        audio_buffer = []
-                        processed_samples = 0
-                        initial_chunk_processed = False
-                        last_process_time = current_time
-                        print(
-                            f"Processed final chunk: {process_size} samples ({process_size/sample_rate:.2f}s), buffer cleared"
-                        )
-
-                    except Exception as e:
-                        import traceback
-
-                        error_msg = str(e)
-                        traceback.print_exc()
-                        print(f"Error during transcription: {error_msg}")
-                        await websocket.send_json(
-                            {"error": error_msg, "status": "error"}
-                        )
-
-            elif "text" in message:
-                # JSON message received (e.g., stop command)
-                try:
-                    data = json.loads(message["text"])
-                    if data.get("action") == "stop":
-                        break
-                except:
-                    pass
+        if use_native_streaming:
+            # Use native streaming input API
+            await _handle_native_streaming(websocket, stt_model, sample_rate)
+        else:
+            # Fall back to VAD-based chunking
+            await _handle_vad_streaming(
+                websocket, stt_model, sample_rate, language, streaming
+            )
 
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         try:
-            await websocket.send_json({"error": str(e), "status": "error"})
+            await websocket.send_json({
+                "type": "error",
+                "error": str(e),
+            })
         except:
             pass
     finally:

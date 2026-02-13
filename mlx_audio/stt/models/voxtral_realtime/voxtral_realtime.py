@@ -89,6 +89,22 @@ class StreamingSTTSession:
     prev_text: str = ""
     finished: bool = False
 
+    def reset(self):
+        """Reset session state for a new utterance."""
+        self.mel_state = StreamingMelState()
+        self.encoder_state.conv0_cache = None
+        self.encoder_state.conv1_cache = None
+        self.encoder_state.kv_caches = [None] * len(self.encoder_state.kv_caches)
+        self.encoder_state.downsample_buffer = None
+        self.encoder_state.position = 0
+        self.decoder_cache = None
+        self.generated_tokens = []
+        self.decoder_position = 0
+        self.adapter_buffer = []
+        self.prompt_built = False
+        self.prev_text = ""
+        self.finished = False
+
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -655,6 +671,16 @@ class Model(nn.Module):
         mx.clear_cache()
 
         return text
+
+    def reset_session(self, session: StreamingSTTSession) -> None:
+        """Reset session state for a new utterance.
+
+        This allows reusing the session object without creating a new one.
+
+        Args:
+            session: Session object to reset
+        """
+        session.reset()
 
     def sanitize(self, weights):
         """Map weight names from consolidated.safetensors to our module structure."""
