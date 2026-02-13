@@ -23,13 +23,13 @@ MODELS = [
         "model_type": "voxtral_realtime",
         "sample_rate": 16000,
     },
-    # VibeVoice and LASR don't have public HF repos yet - tested via unit tests
-    # {
-    #     "name": "VibeVoice ASR",
-    #     "model_path": "...",
-    #     "model_type": "vibevoice_asr",
-    #     "sample_rate": 24000,
-    # },
+    {
+        "name": "VibeVoice ASR",
+        "model_path": "microsoft/VibeVoice-ASR",
+        "model_type": "vibevoice_asr",
+        "sample_rate": 16000,
+    },
+    # LASR doesn't have public HF repo yet
     # {
     #     "name": "LASR-CTC",
     #     "model_path": "...",
@@ -99,7 +99,13 @@ def test_model(model_info):
         start = time.time()
         result = model.generate(audio)
         batch_time = time.time() - start
-        print(f"Text: {result.text[:200]}..." if len(result.text) > 200 else f"Text: {result.text}")
+        # VibeVoice returns JSON diarization format
+        if name == "VibeVoice ASR" and result.text.startswith("["):
+            print(f"Text (diarization JSON): {result.text[:100]}...")
+            if result.segments:
+                print(f"Segments: {len(result.segments)} segments")
+        else:
+            print(f"Text: {result.text[:200]}..." if len(result.text) > 200 else f"Text: {result.text}")
         print(f"Time: {batch_time:.2f}s")
         print(f"RTF: {batch_time / (len(audio)/sample_rate):.3f}x")
 
@@ -122,6 +128,10 @@ def test_model(model_info):
 
             final = model.finish_session(session)
             stream_time = time.time() - start
+
+            # Note: VibeVoice uses two-phase design (no deltas during feed_audio)
+            if name == "VibeVoice ASR":
+                print("(Two-phase design: encode during feed, decode at finish)")
 
             print(f"Deltas received: {len(all_deltas)}")
             print(f"Final text: {final[:200]}..." if len(final) > 200 else f"Final text: {final}")
