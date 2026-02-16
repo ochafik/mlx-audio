@@ -140,8 +140,8 @@ class Model(nn.Module):
 
         Args:
             text: Text to synthesize.
-            voice: Voice name (for multi-speaker models).
-            ref_audio: Reference audio path for voice cloning.
+            voice: Voice name (for multi-speaker models). If not provided, uses a default voice.
+            ref_audio: Reference audio path for voice cloning (for single-speaker models).
             temperature: Sampling temperature (uses config default if not provided).
             stream: If True, yield audio chunks as they're generated.
 
@@ -153,13 +153,25 @@ class Model(nn.Module):
         # Prepare script entries
         entries = self._tts_model.prepare_script([text])
 
-        # Build condition attributes
-        voices = [voice] if voice else None
-        attributes = self._tts_model.make_condition_attributes(
-            voices, self.config.cfg_coef
-        )
+        # Build condition attributes with voice
+        if self._tts_model.multi_speaker:
+            # Multi-speaker model: use voice embedding
+            if voice is None:
+                # Use a default voice from expresso dataset
+                voice = "expresso/ex01-ex02_default_001_channel1_168s.wav"
+                logger.info(f"Using default voice: {voice}")
+            voice_path = self._tts_model.get_voice_path(voice)
+            voices = [voice_path]
+            attributes = self._tts_model.make_condition_attributes(
+                voices, cfg_coef=self.config.cfg_coef
+            )
+        else:
+            # Single-speaker model: uses CFG or reference audio
+            attributes = self._tts_model.make_condition_attributes(
+                [], cfg_coef=self.config.cfg_coef
+            )
 
-        # Get prefix if reference audio provided
+        # Get prefix if reference audio provided (for single-speaker models)
         prefixes = None
         if ref_audio and not self._tts_model.multi_speaker:
             prefixes = self._tts_model.get_prefix(ref_audio)
@@ -214,12 +226,25 @@ class Model(nn.Module):
                 prefixes=prefixes,
             )
 
-            # Decode all frames
-            all_codes = result.audio_codes  # Shape depends on model
-            audio = self._mimi.decode(all_codes)
-            mx.eval(audio)
+            # Decode frames step by step (like run_tts.py)
+            # Skip first delay_steps frames - they contain garbage audio
+            frames_to_decode = result.frames[self._tts_model.delay_steps:]
+            wav_frames = []
+            for frame in frames_to_decode:
+                pcm = self._mimi.decode_step(frame)
+                wav_frames.append(pcm)
 
-            audio_np = np.array(audio.squeeze())
+            # Remove first 2 frames to avoid click/noise at the beginning
+            if len(wav_frames) > 2:
+                wav_frames = wav_frames[2:]
+
+            if wav_frames:
+                audio = mx.concat(wav_frames, axis=-1)
+                mx.eval(audio)
+                audio_np = np.array(audio.squeeze())
+            else:
+                audio_np = np.array([])
+
             samples = len(audio_np)
             duration = samples / SAMPLE_RATE
             elapsed = time.time() - start_time
