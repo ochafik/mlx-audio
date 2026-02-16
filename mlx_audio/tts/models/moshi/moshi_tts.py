@@ -35,6 +35,16 @@ class Model(nn.Module):
         """Skip standard weight loading - we use post_load_hook."""
         return {}
 
+    def model_quant_predicate(self, p, m):
+        """Skip quantization on embeddings and norm layers.
+
+        Note: Moshi TTS handles quantization directly in post_load_hook
+        using explicit nn.quantize() on specific layers (depformer, attention, gating).
+        This predicate is provided for framework consistency.
+        """
+        skip_patterns = ["embed", "norm", "embedding"]
+        return not any(pat in p.lower() for pat in skip_patterns)
+
     @property
     def sample_rate(self) -> int:
         return SAMPLE_RATE
@@ -85,10 +95,15 @@ class Model(nn.Module):
         lm.set_dtype(mx.bfloat16)
         lm.load_pytorch_weights(str(moshi_weight), lm_config, strict=True)
 
-        # Load Mimi decoder
-        mimi_cfg = mimi_202407(config.n_q)
+        # Load Mimi decoder - use generated_codebooks from LM config, not config.n_q
+        generated_codebooks = lm_config.generated_codebooks
+        mimi_cfg = mimi_202407(generated_codebooks)
         mimi = Mimi(mimi_cfg)
-        mimi.load_pytorch_weights(str(mimi_weight), strict=True)
+        mimi.load_pytorch_weights(str(mimi_weight), strict=False)
+        logger.info(f"Mimi loaded with {generated_codebooks} codebooks")
+
+        # Use generated_codebooks for n_q (TTS models typically use 32, not 8)
+        n_q = config.n_q if config.n_q > 0 else generated_codebooks
 
         # Create TTS model wrapper
         model._tts_model = TTSModel(
@@ -98,13 +113,12 @@ class Model(nn.Module):
             raw_config=config_dict,
             temp=config.temp,
             cfg_coef=config.cfg_coef,
-            n_q=config.n_q,
+            n_q=n_q,
             max_gen_length=config.max_gen_length,
             padding_bonus=config.padding_bonus,
             initial_padding=config.initial_padding,
             max_padding=config.max_padding,
             final_padding=config.final_padding,
-            padding_between=config.padding_between,
         )
         model._mimi = mimi
 
@@ -162,7 +176,7 @@ class Model(nn.Module):
 
             # Run generation with frame callback
             result = self._tts_model.generate(
-                all_entries=entries,
+                all_entries=[entries],  # entries is a list of Entry objects, wrap in another list for batch
                 attributes=[attributes],
                 prefixes=prefixes,
                 on_frame=on_frame,
@@ -195,7 +209,7 @@ class Model(nn.Module):
         else:
             # Batch mode: generate all at once
             result = self._tts_model.generate(
-                all_entries=entries,
+                all_entries=[entries],  # entries is a list of Entry objects, wrap in another list for batch
                 attributes=[attributes],
                 prefixes=prefixes,
             )

@@ -86,6 +86,15 @@ class Model(nn.Module):
         """Skip standard weight loading - we use post_load_hook."""
         return {}
 
+    def model_quant_predicate(self, p, m):
+        """Skip quantization on embeddings and norm layers.
+
+        Note: Moshi STT handles quantization directly in post_load_hook,
+        but this predicate is provided for consistency with the framework.
+        """
+        skip_patterns = ["embed", "norm", "embedding"]
+        return not any(pat in p.lower() for pat in skip_patterns)
+
     @classmethod
     def post_load_hook(cls, model: "Model", model_path: Path) -> "Model":
         """Load Moshi model weights and components."""

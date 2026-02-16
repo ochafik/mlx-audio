@@ -276,7 +276,9 @@ class Model(nn.Module):
         return sanitized_weights
 
     def model_quant_predicate(self, p, m):
-        return not p.startswith("audio_tower")
+        # Skip audio tower and embeddings (tied embeddings require full precision)
+        skip = p.startswith("audio_tower") or "embed_tokens" in p
+        return not skip
 
     @classmethod
     def post_load_hook(cls, model: "Model", model_path: Path) -> "Model":
