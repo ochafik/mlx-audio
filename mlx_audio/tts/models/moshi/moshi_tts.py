@@ -181,8 +181,9 @@ class Model(nn.Module):
             audio_chunks = []
 
             def on_frame(frame_codes: mx.array):
-                # Decode frame to audio
-                audio = self._mimi.decode_step(frame_codes)  # (1, 1, 1920)
+                # Frame shape is (batch, codebooks), need to add time dimension for decode_step
+                frame_with_time = frame_codes[:, :, None]  # (batch, codebooks, 1)
+                audio = self._mimi.decode_step(frame_with_time)  # (1, 1, 1920)
                 mx.eval(audio)
                 audio_chunks.append(audio)
 
